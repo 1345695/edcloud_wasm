@@ -295,9 +295,7 @@ pub unsafe extern "C" fn parseProtocolWasm(chunk_len: i32, step: i32) -> bool {
     }
 
     // 3. HTTP CONNECT
-    // 保留 len >= 10 是为了防止下面的 len - 4 发生整数下溢 (Integer Underflow) 导致 Wasm 崩溃
-    if len >= 10 && b0 == b'C' && *COMMON_BUF.get_unchecked(1) == b'O' {
-        // 移除 len >= 24 检查
+    if len >= 24 && b0 == b'C' && *COMMON_BUF.get_unchecked(1) == b'O' {
         if *COMMON_BUF.get_unchecked(len - 4) == 13
             && *COMMON_BUF.get_unchecked(len - 3) == 10
             && *COMMON_BUF.get_unchecked(len - 2) == 13

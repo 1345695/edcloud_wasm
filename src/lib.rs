@@ -33,7 +33,7 @@ use core::panic::PanicInfo;
 /// [22]: Turn 参数偏移,   [23]: Turn 参数长度
 static mut RESULT: [i32; 32] = [0; 32];
 
-static mut COMMON_BUF: [u8; 8192] = [0; 8192]; // 8KB 通用数据缓冲区
+static mut COMMON_BUF: [u8; 2048] = [0; 2048]; // 2KB 通用数据缓冲区
 static mut UUID: [u8; 16] = [0; 16]; // VLESS UUID
 static mut HASH: [u8; 56] = [0; 56]; // Trojan Hash
 static mut HTTP_AUTH: [u8; 512] = [0; 512]; // HTTP Auth (Base64) - 512 字节

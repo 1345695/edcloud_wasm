@@ -518,7 +518,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
         const c = clean.charCodeAt(l - 1);
         if (c === 47 || c === 61) clean = clean.slice(0, l - 1);
     }
-    if (clean.length < 6) {
+    if (clean.length < 6 || clean.length > 2048) {
         list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
     } else {
         const urlBytes = textEncoder.encode(clean);

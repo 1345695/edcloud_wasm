@@ -1,6 +1,6 @@
 name = "edcloudwasm"
 main = "_worker.js"  # 你的 JS 逻辑代码
-compatibility_date = "2026-04-04"
+compatibility_date = "2026-04-15"
 
 # pages中环境变量需要手动填写并重试部署才会生效，worker环境变量和路由自定义域名这些建议直接使用wrangler.toml文件来配置
 # --- worker环境变量配置 ---

@@ -272,7 +272,7 @@ export default {
     async fetch(請求) {
         if (請求.headers.get('Upgrade') === 'websocket') {
             const {0: 客戶端插槽, 1: 網頁套接字連線} = new WebSocketPair();
-            網頁套接字連線.accept(), 網頁套接字連線.binaryType = "arraybuffer";
+            網頁套接字連線.accept({allowHalfOpen: true}), 網頁套接字連線.binaryType = "arraybuffer";
             處理網頁套接字連線(網頁套接字連線, 請求);
             return new Response(null, {status: 101, webSocket: 客戶端插槽});
         }

@@ -86,7 +86,7 @@ export default {
     async fetch(request) {
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
-            webSocket.accept(), webSocket.binaryType = "arraybuffer";
+            webSocket.accept({allowHalfOpen: true}), webSocket.binaryType = "arraybuffer";
             handleWebSocketConn(webSocket, request);
             return new Response(null, {status: 101, webSocket: clientSocket});
         } else {return new Response(null, {status: 400})}

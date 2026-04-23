@@ -28,8 +28,8 @@ let concurrency = 4;//socket获取并发数
 // ---------------------------------------------------------------------------------
 const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
 // ---------------------------------------------------------------------------------
-//四者的socket获取顺序，全局模式下为这四个的顺序，非全局为：直连>socks>http>turn>nat64>proxyip>finallyProxyHost
-const proxyStrategyOrder = ['socks', 'http', 'turn', 'nat64'];
+//五者的socket获取顺序，全局模式下为这五个的顺序，非全局为：直连>socks>http>https>turn>nat64>proxyip>finallyProxyHost
+const proxyStrategyOrder = ['socks', 'http', 'https', 'turn', 'nat64'];
 const sharedEchDns = 'cloudflare-ech.com+https://223.5.5.5/dns-query'; //ECHDNS配置
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
 const dohNatEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
@@ -175,10 +175,10 @@ const parseAuthString = (authParam) => {
     const [hostname, port] = parseHostPort(hostStr, 1080);
     return {username, password, hostname, port};
 };
-const createConnect = (hostname, port, socket = connect({hostname, port})) => socket.opened.then(() => socket);
-const concurrentConnect = (hostname, port, limit = concurrency) => {
-    if (limit === 1) return createConnect(hostname, port);
-    return Promise.any(Array(limit).fill(null).map(() => createConnect(hostname, port)));
+const createConnect = (hostname, port, socketOptions, socket = connect({hostname, port}, socketOptions)) => socket.opened.then(() => socket);
+const concurrentConnect = (hostname, port, limit = concurrency, socketOptions) => {
+    if (limit === 1) return createConnect(hostname, port, socketOptions);
+    return Promise.any(Array(limit).fill(null).map(() => createConnect(hostname, port, socketOptions)));
 };
 const connectViaSocksProxy = async (targetAddrType, targetPortNum, socksAuth, addrBytes, limit) => {
     const socksSocket = await concurrentConnect(socksAuth.hostname, socksAuth.port, limit);
@@ -209,9 +209,10 @@ const connectViaSocksProxy = async (targetAddrType, targetPortNum, socksAuth, ad
 };
 const staticHeaders = `User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\r\nProxy-Connection: Keep-Alive\r\nConnection: Keep-Alive\r\n\r\n`;
 const encodedStaticHeaders = textEncoder.encode(staticHeaders);
-const connectViaHttpProxy = async (targetAddrType, targetPortNum, httpAuth, addrBytes, limit) => {
+const connectViaHttpProxy = async (targetAddrType, targetPortNum, httpAuth, addrBytes, limit, useTls = false) => {
     const {username, password, hostname, port} = httpAuth;
-    const proxySocket = await concurrentConnect(hostname, port, limit);
+    const connectOptions = useTls ? {secureTransport: 'on', allowHalfOpen: false} : undefined;
+    const proxySocket = await concurrentConnect(hostname, port, limit, connectOptions);
     const writer = proxySocket.writable.getWriter();
     const httpHost = binaryAddrToString(targetAddrType, addrBytes);
     let dynamicHeaders = `CONNECT ${httpHost}:${targetPortNum} HTTP/1.1\r\nHost: ${httpHost}:${targetPortNum}\r\n`;
@@ -490,6 +491,9 @@ const strategyExecutorMap = new Map([
     [2, async ({addrType, port, addrBytes}, param, limit) => {
         return connectViaHttpProxy(addrType, port, param, addrBytes, limit);
     }],
+    [6, async ({addrType, port, addrBytes}, param, limit) => {
+        return connectViaHttpProxy(addrType, port, param, addrBytes, limit, true);
+    }],
     [3, async (_parsedRequest, param, limit) => {
         return connectProxyIp(param, limit);
     }],
@@ -538,7 +542,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
             wasmMem.set(urlBytes, dataPtr);
             parseUrlWasm(urlBytes.length);
             const r = wasmRes;
-            const s5Val = getUrlParam(r[15], r[16]), httpVal = getUrlParam(r[17], r[18]), nat64Val = getUrlParam(r[19], r[20]), turnVal = getUrlParam(r[24], r[25]), ipVal = getUrlParam(r[21], r[22]);
+            const s5Val = getUrlParam(r[15], r[16]), httpVal = getUrlParam(r[17], r[18]), nat64Val = getUrlParam(r[19], r[20]), turnVal = getUrlParam(r[24], r[25]), ipVal = getUrlParam(r[21], r[22]), httpsVal = getUrlParam(r[26], r[27]);
             const proxyAll = r[23] === 1;
             !proxyAll && list.push({type: 0});
             const add = (v, t) => {
@@ -547,13 +551,13 @@ const establishTcpConnection = async (parsedRequest, request) => {
                 if (parts.length) {
                     const parsedParams = parts.map(part => {
                         if (t === 4) return {nat64Auth: part, proxyAll};
-                        if (t === 1 || t === 2 || t === 5) return parseAuthString(part);
+                        if (t === 1 || t === 2 || t === 5 || t === 6) return parseAuthString(part);
                         return part;
                     });
                     list.push({type: t, param: parsedParams, concurrent: true});
                 }
             };
-            for (const k of proxyStrategyOrder) k === 'socks' ? add(s5Val, 1) : k === 'http' ? add(httpVal, 2) : k === 'turn' ? add(turnVal, 5) : add(nat64Val, 4);
+            for (const k of proxyStrategyOrder) k === 'socks' ? add(s5Val, 1) : k === 'http' ? add(httpVal, 2) : k === 'https' ? add(httpsVal, 6) : k === 'turn' ? add(turnVal, 5) : add(nat64Val, 4);
             if (proxyAll) {
                 !list.length && list.push({type: 0});
             } else {

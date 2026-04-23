@@ -7,13 +7,14 @@
 // xhttp模式的trojan导入链接：trojan://passwd@104.16.40.11:2053?security=tls&sni=sni&alpn=h2&fp=chrome&allowInsecure=1&type=xhttp&host=host&path=%2F&mode=stream-one#trojan-xhttp
 // 复制协议开头的导入链接导入再手动修改即可
  * ========================== URL路径参数速查表 =================================================================================
- * 多个参数用 & 连接, 示例: /?s5=host:port&ip=1.2.3.4:443   注: s5/http/nat64/ip 均支持逗号分隔多个地址以实现并发连接
+ * 多个参数用 & 连接, 示例: /?s5=host:port&ip=1.2.3.4:443   注: s5/http/https/nat64/ip 均支持逗号分隔多个地址以实现并发连接
  * s5/gs5/socks/s5all         - 直连失败SOCKS5代理 / 全局SOCKS5        示例: s5=user1:pass1@host1:port1,user2:pass2@host2:port2
  * http/ghttp/httpall         - 直连失败HTTP代理 / 全局HTTP            示例: http=user1:pass1@host1:port1,user2:pass2@host2:port2
+ * https/ghttps/httpsall      - 直连失败HTTPS代理 / 全局HTTPS          示例: https=user1:pass1@host1:port1,user2:pass2@host2:port2
  * nat64/gnat64/nat64all      - 直连失败NAT64转换 / 全局NAT64          示例: nat64=64:ff9b::,64:ff9b:1::
  * turn/gturn/turnall         - 直连失败TURN代理 / 全局TURN            示例: turn=user1:pass1@host1:port1,user2:pass2@host2:port2
  * ip/pyip/proxyip            - 直连失败时的备用IP                     示例: ip=1.2.3.4:443,5.6.7.8:443
- * proxyall/globalproxy       - 全局代理标志,无s5和http参数时纯直连      示例: proxyall=1
+ * proxyall/globalproxy       - 全局代理标志,无s5/http/https参数时纯直连 示例: proxyall=1
  * ==========================================================================================================================*/
 import {connect} from 'cloudflare:sockets';
 //**警告**:不看开头注释直接把域名地址扔浏览器里会收获彩蛋一枚
@@ -50,9 +51,9 @@ let concurrency = 4;//socket获取并发数
 // ---------------------------------------------------------------------------------
 const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
 // ---------------------------------------------------------------------------------
-//四者的socket获取顺序，全局模式下为这四个的顺序，非全局为：直连>socks>http>turn>nat64>proxyip>finallyProxyHost
+//五者的socket获取顺序，全局模式下为这五个的顺序，非全局为：直连>socks>http>https>turn>nat64>proxyip>finallyProxyHost
 /**- **警告**: snippets只支持最大两次connect，所以snippets全局nat64不能使用域名访问，snippets访问cf失败的备用只有第一个有效*/
-const proxyStrategyOrder = ['socks', 'http', 'turn', 'nat64'];
+const proxyStrategyOrder = ['socks', 'http', 'https', 'turn', 'nat64'];
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
 const dohNatEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
 const proxyIpAddrs = {EU: 'ProxyIP.DE.CMLiussss.net', AS: 'ProxyIP.SG.CMLiussss.net', JP: 'ProxyIP.JP.CMLiussss.net', US: 'ProxyIP.US.CMLiussss.net'};//分区域proxyip
@@ -141,10 +142,10 @@ const isIPv4 = (str) => {
     }
     return dots === 3 && partLen > 0 && !(partLen > 1 && head === 48);
 };
-const createConnect = (hostname, port, socket = connect({hostname, port})) => socket.opened.then(() => socket);
-const concurrentConnect = (hostname, port, limit = concurrency) => {
-    if (limit === 1) return createConnect(hostname, port);
-    return Promise.any(Array(limit).fill(null).map(() => createConnect(hostname, port)));
+const createConnect = (hostname, port, socketOptions, socket = connect({hostname, port}, socketOptions)) => socket.opened.then(() => socket);
+const concurrentConnect = (hostname, port, limit = concurrency, socketOptions) => {
+    if (limit === 1) return createConnect(hostname, port, socketOptions);
+    return Promise.any(Array(limit).fill(null).map(() => createConnect(hostname, port, socketOptions)));
 };
 const connectViaSocksProxy = async (targetAddrType, targetPortNum, socksAuth, addrBytes, limit) => {
     const socksSocket = await concurrentConnect(socksAuth.hostname, socksAuth.port, limit);
@@ -175,9 +176,10 @@ const connectViaSocksProxy = async (targetAddrType, targetPortNum, socksAuth, ad
 };
 const staticHeaders = `User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\r\nProxy-Connection: Keep-Alive\r\nConnection: Keep-Alive\r\n\r\n`;
 const encodedStaticHeaders = textEncoder.encode(staticHeaders);
-const connectViaHttpProxy = async (targetAddrType, targetPortNum, httpAuth, addrBytes, limit) => {
+const connectViaHttpProxy = async (targetAddrType, targetPortNum, httpAuth, addrBytes, limit, useTls = false) => {
     const {username, password, hostname, port} = httpAuth;
-    const proxySocket = await concurrentConnect(hostname, port, limit);
+    const connectOptions = useTls ? {secureTransport: 'on', allowHalfOpen: false} : undefined;
+    const proxySocket = await concurrentConnect(hostname, port, limit, connectOptions);
     const writer = proxySocket.writable.getWriter();
     const httpHost = binaryAddrToString(targetAddrType, addrBytes);
     let dynamicHeaders = `CONNECT ${httpHost}:${targetPortNum} HTTP/1.1\r\nHost: ${httpHost}:${targetPortNum}\r\n`;
@@ -611,6 +613,9 @@ const strategyExecutorMap = new Map([
     [2, async ({addrType, port, addrBytes}, param, limit) => {
         return connectViaHttpProxy(addrType, port, param, addrBytes, limit);
     }],
+    [6, async ({addrType, port, addrBytes}, param, limit) => {
+        return connectViaHttpProxy(addrType, port, param, addrBytes, limit, true);
+    }],
     [3, async (_parsedRequest, param, limit) => {
         return connectProxyIp(param, limit);
     }],
@@ -631,7 +636,7 @@ const strategyExecutorMap = new Map([
         return connectViaTurnProxy(param, targetIp, port);
     }]
 ]);
-const paramRegex = /(gs5|s5all|ghttp|httpall|gnat64|nat64all|gturn|turnall|s5|socks|http|nat64|turn|ip)(?:=|:\/\/|%3A%2F%2F)([^&]+)|(proxyall|globalproxy)/gi;
+const paramRegex = /(gs5|s5all|ghttp|httpall|ghttps|httpsall|gnat64|nat64all|gturn|turnall|s5|socks|http|https|nat64|turn|ip)(?:=|:\/\/|%3A%2F%2F)([^&]+)|(proxyall|globalproxy)/gi;
 const urlListCacheDict = Object.create(null), urlListCacheKeys = new Array(urlParamCacheLimit);
 let urlListCacheIndex = 0;
 const establishTcpConnection = async (parsedRequest, request) => {
@@ -653,8 +658,8 @@ const establishTcpConnection = async (parsedRequest, request) => {
             paramRegex.lastIndex = 0;
             let m;
             while ((m = paramRegex.exec(clean))) {p[(m[1] || m[3]).toLowerCase()] = m[2] ? (m[2].charCodeAt(m[2].length - 1) === 61 ? m[2].slice(0, -1) : m[2]) : true}
-            const s5 = p.gs5 || p.s5all || p.s5 || p.socks, http = p.ghttp || p.httpall || p.http, nat64 = p.gnat64 || p.nat64all || p.nat64, turn = p.gturn || p.turnall || p.turn;
-            const proxyAll = !!(p.gs5 || p.s5all || p.ghttp || p.httpall || p.gnat64 || p.nat64all || p.gturn || p.turnall || p.proxyall || p.globalproxy);
+            const s5 = p.gs5 || p.s5all || p.s5 || p.socks, http = p.ghttp || p.httpall || p.http, https = p.ghttps || p.httpsall || p.https, nat64 = p.gnat64 || p.nat64all || p.nat64, turn = p.gturn || p.turnall || p.turn;
+            const proxyAll = !!(p.gs5 || p.s5all || p.ghttp || p.httpall || p.ghttps || p.httpsall || p.gnat64 || p.nat64all || p.gturn || p.turnall || p.proxyall || p.globalproxy);
             if (!proxyAll) list.push({type: 0});
             const add = (v, t) => {
                 if (!v) return;
@@ -662,7 +667,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
                 if (parts.length) {
                     const parsedParams = parts.map(part => {
                         if (t === 4) return {nat64Auth: part, proxyAll};
-                        if (t === 1 || t === 2 || t === 5) return parseAuthString(part);
+                        if (t === 1 || t === 2 || t === 5 || t === 6) return parseAuthString(part);
                         return part;
                     });
                     list.push({type: t, param: parsedParams, concurrent: true});
@@ -670,7 +675,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
             };
             for (let i = 0; i < proxyStrategyOrder.length; i++) {
                 const k = proxyStrategyOrder[i];
-                add(k === 'socks' ? s5 : k === 'http' ? http : k === 'turn' ? turn : nat64, k === 'socks' ? 1 : k === 'http' ? 2 : k === 'turn' ? 5 : 4);
+                add(k === 'socks' ? s5 : k === 'http' ? http : k === 'https' ? https : k === 'turn' ? turn : nat64, k === 'socks' ? 1 : k === 'http' ? 2 : k === 'https' ? 6 : k === 'turn' ? 5 : 4);
             }
             if (proxyAll) {
                 if (!list.length) list.push({type: 0});
@@ -883,3 +888,4 @@ export default {
         return new Response(html, {status: 200, headers: {'Content-Type': 'text/html; charset=UTF-8'}});
     }
 };
+

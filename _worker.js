@@ -4,6 +4,7 @@ const defaultUuid = ''; // 可在环境变量配置，变量名称为UUID，两�
 const defaultPassword = ''; // 可在环境变量配置，变量名称为PASSWORD，两个地方都不写为不验证密码
 const socks5AndHttpUser = ''; // 可在环境变量配置，变量名称为S5HTTPUSER，两个地方都不写为不验证密码
 const socks5AndHttpPass = ''; // 可在环境变量配置，变量名称为S5HTTPPASS，两个地方都不写为不验证密码
+const ssAeadPassword = ''; // 可在环境变量配置，变量名称为SSPASS
 // ---------------------------------------------------------------------------------
 // 理论最低带宽计算公式 (Theoretical Max Bandwidth Calculation):
 //    - 速度上限 (Mbps) = (bufferSize (字节) / flushTime (毫秒)) * 0.008
@@ -23,6 +24,9 @@ const maxChunkLen = 64 * 1024;        // 64KB
 /** 进入缓冲模式时的缓冲区发送的触发时间。*/
 const flushTime = 20;                 // 20ms
 // ---------------------------------------------------------------------------------
+/** SS AEAD加密时每批并发处理的payload分片数量，length加密开销低，会随payload一起提交。*/
+const ssAeadEncryptCount = 4;
+// ---------------------------------------------------------------------------------
 /**- **警告**: worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
 // ---------------------------------------------------------------------------------
@@ -30,7 +34,7 @@ const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
 // ---------------------------------------------------------------------------------
 //五者的socket获取顺序，全局模式下为这五个的顺序，非全局为：直连>socks>http>https>turn>nat64>proxyip>finallyProxyHost
 const proxyStrategyOrder = ['socks', 'http', 'https', 'turn', 'nat64'];
-const sharedEchDns = 'cloudflare-ech.com+https://223.5.5.5/dns-query'; //ECHDNS配置
+const sharedEchDns = 'lido.fi+https://223.5.5.5/dns-query'; //ECHDNS配置
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
 const dohNatEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
 const proxyIpAddrs = {EU: 'ProxyIP.DE.CMLiussss.net', AS: 'ProxyIP.SG.CMLiussss.net', JP: 'ProxyIP.JP.CMLiussss.net', US: 'ProxyIP.US.CMLiussss.net'};//分区域proxyip
@@ -62,7 +66,7 @@ const {
 const wasmMem = new Uint8Array(memory.buffer);
 const wasmRes = new Int32Array(memory.buffer, getResultPtr(), 32);
 const dataPtr = getDataPtr();
-let isInitialized = false, rawHtml = null, rawErrorHtml = null, config = null, cachedTemplates = null, strList = null, subConfig = null, userAgentSuffix = null;
+let isInitialized = false, rawHtml = null, rawErrorHtml = null, config = null, cachedTemplates = null, strList = null, userAgentSuffix = null;
 const decompressWasm = async (ptrFn, lenFn) => {
     const ptr = ptrFn(), len = lenFn();
     const compressedData = wasmMem.subarray(ptr, ptr + len);
@@ -78,7 +82,8 @@ const getEnv = (env) => {
         uuid: (env.UUID || defaultUuid).trim(),
         password: (env.PASSWORD || defaultPassword).trim(),
         user: (env.S5HTTPUSER || socks5AndHttpUser).trim(),
-        pass: (env.S5HTTPPASS || socks5AndHttpPass).trim()
+        pass: (env.S5HTTPPASS || socks5AndHttpPass).trim(), 
+        sspass: (env.SSPASS || ssAeadPassword).trim()
     };
     return config;
 };
@@ -120,7 +125,6 @@ const initializeWasm = (env) => {
     for (let i = 0; i < 20; i++) {strList[i] = getSecret(i)}
     const edge = strList[2];
     userAgentSuffix = edge + strList[3] + edge + strList[4];
-    subConfig = {SUBAPI: strList[0], SUBCONFIG: strList[1], FILENAME: "Free-Nodes"};
     for (let i = 0; i < 12; i++) {
         const len = getTemplateWasm(i);
         const tmpl = textDecoder.decode(wasmMem.subarray(dataPtr, dataPtr + len));
@@ -135,6 +139,154 @@ const binaryAddrToString = (addrType, addrBytes) => {
     let ipv6 = ((addrBytes[0] << 8) | addrBytes[1]).toString(16);
     for (let i = 1; i < 8; i++) ipv6 += ':' + ((addrBytes[i * 2] << 8) | addrBytes[i * 2 + 1]).toString(16);
     return `[${ipv6}]`;
+};
+const emptyU8 = new Uint8Array(0), ssSubkeyInfo = textEncoder.encode('ss-subkey');
+const incNonce = (nonce) => {
+    for (let i = 0; i < 12; i++) {
+        nonce[i] = (nonce[i] + 1) & 0xff;
+        if (nonce[i] !== 0) break;
+    }
+};
+let ssMasterKeyPromise, ssHkdfKeyPromise;
+const createSsAeadCtx = async (salt = crypto.getRandomValues(new Uint8Array(16))) => {
+    const hkdfKey = await (ssHkdfKeyPromise ||= (async () => {
+        const masterKey = await (ssMasterKeyPromise ||= (async () => {
+            const pwd = textEncoder.encode(config.sspass);
+            const out = new Uint8Array(16);
+            let prev = emptyU8, offset = 0;
+            while (offset < 16) {
+                const input = new Uint8Array(prev.length + pwd.length);
+                if (prev.length) input.set(prev, 0);
+                input.set(pwd, prev.length);
+                prev = new Uint8Array(await crypto.subtle.digest('MD5', input));
+                const copyLen = Math.min(prev.length, 16 - offset);
+                out.set(prev.subarray(0, copyLen), offset);
+                offset += copyLen;
+            }
+            return out;
+        })());
+        return crypto.subtle.importKey('raw', masterKey, 'HKDF', false, ['deriveBits']);
+    })());
+    const subKey = new Uint8Array(await crypto.subtle.deriveBits({name: 'HKDF', hash: 'SHA-1', salt, info: ssSubkeyInfo}, hkdfKey, 128));
+    return {
+        salt,
+        key: await crypto.subtle.importKey('raw', subKey, {name: 'AES-GCM', length: 128}, false, ['encrypt', 'decrypt']),
+        nonce: new Uint8Array(12),
+        pendingBuf: new Uint8Array(0),
+        pendingStart: 0,
+        pendingEnd: 0,
+        nextPayloadLen: -1,
+        nextNeed: 0
+    };
+};
+const ssAeadDecryptFeed = async (ctx, chunk, onPlain) => {
+    if (chunk?.length) {
+        const chunkLen = chunk.length;
+        const pendingLen = ctx.pendingEnd - ctx.pendingStart;
+        if (!pendingLen) {
+            if (chunkLen > ctx.pendingBuf.length) ctx.pendingBuf = new Uint8Array(chunkLen);
+            ctx.pendingBuf.set(chunk, 0);
+            ctx.pendingStart = 0;
+            ctx.pendingEnd = chunkLen;
+        } else {
+            if (ctx.pendingBuf.length - ctx.pendingEnd < chunkLen) {
+                if (ctx.pendingStart > 0) {
+                    ctx.pendingBuf.copyWithin(0, ctx.pendingStart, ctx.pendingEnd);
+                    ctx.pendingEnd = pendingLen;
+                    ctx.pendingStart = 0;
+                }
+                if (ctx.pendingBuf.length - ctx.pendingEnd < chunkLen) {
+                    const nextCap = pendingLen + chunkLen;
+                    const nextBuf = new Uint8Array(nextCap);
+                    nextBuf.set(ctx.pendingBuf.subarray(ctx.pendingStart, ctx.pendingEnd), 0);
+                    ctx.pendingBuf = nextBuf;
+                    ctx.pendingStart = 0;
+                    ctx.pendingEnd = pendingLen;
+                }
+            }
+            ctx.pendingBuf.set(chunk, ctx.pendingEnd);
+            ctx.pendingEnd += chunkLen;
+        }
+    }
+    const out = onPlain ? null : [];
+    let total = 0, pendingStart = ctx.pendingStart, pendingEnd = ctx.pendingEnd;
+    const pendingBuf = ctx.pendingBuf;
+    while (true) {
+        const pendingLen = pendingEnd - pendingStart;
+        if (ctx.nextPayloadLen < 0) {
+            if (pendingLen < 18) break;
+            let lenPlain;
+            try {
+                lenPlain = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, pendingBuf.subarray(pendingStart, pendingStart + 18)));
+            } catch {throw new Error('ss length decrypt failed')}
+            incNonce(ctx.nonce);
+            const payloadLen = (lenPlain[0] << 8) | lenPlain[1];
+            if (payloadLen > 16383) throw new Error('ss payload too large');
+            ctx.nextPayloadLen = payloadLen;
+            ctx.nextNeed = 18 + payloadLen + 16;
+        }
+        if (pendingLen < ctx.nextNeed) break;
+        let payload;
+        try {
+            payload = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, pendingBuf.subarray(pendingStart + 18, pendingStart + ctx.nextNeed)));
+        } catch {throw new Error('ss payload decrypt failed')}
+        incNonce(ctx.nonce);
+        pendingStart += ctx.nextNeed;
+        ctx.nextPayloadLen = -1;
+        ctx.nextNeed = 0;
+        if (onPlain) await onPlain(payload);
+        else out.push(payload), total += payload.length;
+    }
+    if (pendingStart === pendingEnd) {
+        ctx.pendingStart = 0;
+        ctx.pendingEnd = 0;
+    } else {
+        ctx.pendingStart = pendingStart;
+        ctx.pendingEnd = pendingEnd;
+    }
+    if (onPlain || out.length === 0) return emptyU8;
+    if (out.length === 1) return out[0];
+    const merged = new Uint8Array(total);
+    for (let i = 0, o = 0; i < out.length; i++) {
+        merged.set(out[i], o);
+        o += out[i].length;
+    }
+    return merged;
+};
+const ssAeadEncryptChunks = async (ctx, data) => {
+    if (!data?.length) return emptyU8;
+    const dataLen = data.length;
+    const out = new Uint8Array(dataLen + Math.ceil(dataLen / 16383) * 34);
+    const {key, nonce} = ctx;
+    const subtle = crypto.subtle;
+    let outOffset = 0;
+    for (let base = 0; base < dataLen; base += 16383 * ssAeadEncryptCount) {
+        const batchEnd = Math.min(base + 16383 * ssAeadEncryptCount, dataLen);
+        const tasks = [];
+        for (let offset = base; offset < batchEnd; offset += 16383) {
+            const end = offset + 16383 < dataLen ? offset + 16383 : dataLen;
+            const p = offset === 0 && end === dataLen ? data : data.subarray(offset, end), l = end - offset;
+            const lenBuf = new Uint8Array([l >> 8, l & 0xff]);
+            const lenIv = nonce.slice();
+            incNonce(nonce);
+            const dataIv = nonce.slice();
+            incNonce(nonce);
+            tasks.push((async () => {
+                const lenCipher = await subtle.encrypt({name: 'AES-GCM', iv: lenIv, tagLength: 128}, key, lenBuf);
+                const dataCipher = await subtle.encrypt({name: 'AES-GCM', iv: dataIv, tagLength: 128}, key, p);
+                return {l, lenCipher, dataCipher};
+            })());
+        }
+        const results = await Promise.all(tasks);
+        for (let i = 0; i < results.length; i++) {
+            const {l, lenCipher, dataCipher} = results[i];
+            out.set(new Uint8Array(lenCipher), outOffset);
+            outOffset += 18;
+            out.set(new Uint8Array(dataCipher), outOffset);
+            outOffset += l + 16;
+        }
+    }
+    return out;
 };
 const parseHostPort = (addr, defaultPort) => {
     let host = addr, port = defaultPort, idx;
@@ -246,7 +398,7 @@ const connectViaHttpProxy = async (targetAddrType, targetPortNum, httpAuth, addr
     }
     return null;
 };
-const MAGIC = new Uint8Array([0x21, 0x12, 0xA4, 0x42]);
+const magic = new Uint8Array([0x21, 0x12, 0xA4, 0x42]);
 const cat = (...a) => {
     let len = 0, i = 0, o = 0;
     for (; i < a.length; i++) len += a[i].length;
@@ -264,7 +416,7 @@ const stunAttr = (t, v) => {
 };
 const stunMsg = (t, tid, a) => {
     const bd = cat(...a), l = bd.length, h = new Uint8Array(20 + l);
-    h[0] = t >> 8, h[1] = t & 0xff, h[2] = l >> 8, h[3] = l & 0xff, h.set(MAGIC, 4), h.set(tid, 8), h.set(bd, 20);
+    h[0] = t >> 8, h[1] = t & 0xff, h[2] = l >> 8, h[3] = l & 0xff, h.set(magic, 4), h.set(tid, 8), h.set(bd, 20);
     return h;
 };
 const xorPeer = (ip, port) => {
@@ -276,15 +428,15 @@ const xorPeer = (ip, port) => {
     for (let i = 0; i < ip.length; i++) {
         const c = ip.charCodeAt(i);
         if (c === 46) {
-            b[4 + p] = num ^ MAGIC[p++];
+            b[4 + p] = num ^ magic[p++];
             num = 0;
         } else {num = num * 10 + (c - 48)}
     }
-    b[4 + p] = num ^ MAGIC[p];
+    b[4 + p] = num ^ magic[p];
     return b;
 };
 const parseStun = d => {
-    if (d.length < 20 || MAGIC.some((v, i) => d[4 + i] !== v)) return null;
+    if (d.length < 20 || magic.some((v, i) => d[4 + i] !== v)) return null;
     const ml = (d[2] << 8) | d[3], attrs = {};
     for (let o = 20; o + 4 <= 20 + ml;) {
         const t = (d[o] << 8) | d[o + 1], l = (d[o + 2] << 8) | d[o + 3];
@@ -599,14 +751,14 @@ for (let i = 0; i < 60; i++) {
     else chunkIdxLookup[i] = 12;
 }
 const lowerBounds = new Uint16Array([1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 12288, 20480, 28672]);
-const manualPipe = async (readable, writable) => {
+const smartPipeCore = async (readable, onFlush) => {
     const safeBufferSize = bufferSize - maxChunkLen;
     let buffer = new Uint8Array(bufferSize), chunkBuf = new ArrayBuffer(maxChunkLen);
     let offset = 0, totalBytes = 0, time = 2, timerId = null, resume = null;
     let globalCount = new Float64Array(14), globalBytes = new Float64Array(14);
     let statCount = 0, totalCount = 0, totalGlobalBytes = 0;
     const flushBuffer = () => {
-        offset > 0 && (writable.send(buffer.slice(0, offset)), offset = 0);
+        offset > 0 && (onFlush(buffer.slice(0, offset)), offset = 0);
         timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
     const reader = readable.getReader({mode: 'byob'});
@@ -615,7 +767,9 @@ const manualPipe = async (readable, writable) => {
             const {done, value} = await reader.read(new Uint8Array(chunkBuf));
             if (done) break;
             chunkBuf = value.buffer;
-            const chunkLen = value.byteLength, idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
+            const chunkLen = value.byteLength;
+            if (!chunkLen) continue;
+            const idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
             globalCount[idx]++, globalBytes[idx] += chunkLen;
             statCount++, totalCount++, totalGlobalBytes += chunkLen;
             if (statCount > 1000000) {
@@ -637,6 +791,10 @@ const manualPipe = async (readable, writable) => {
     } finally {flushBuffer(), reader.releaseLock()}
 };
 const handleSession = async (chunk, state, request, writable, close) => {
+    const allowNeedMore = state.allowNeedMore === true;
+    if (allowNeedMore) state.needMore = false;
+    let parsedRequest, payload, isSs = false;
+    const ssEnabled = !state.disableSsAead && !!config?.sspass && !state.tcpWriter && state.socks5State === 0;
     const parseLen = Math.min(chunk.length, 1024);
     wasmMem.set(chunk.subarray(0, parseLen), dataPtr);
     const success = parseProtocolWasm(parseLen, state.socks5State);
@@ -644,35 +802,95 @@ const handleSession = async (chunk, state, request, writable, close) => {
     const hLen = r[12];
     if (hLen > 0) writable.send(wasmMem.slice(dataPtr, dataPtr + hLen));
     if (!success) {
-        const nextState = r[4];
-        if (nextState > 0) {
-            state.socks5State = nextState;
-            return;
+        if (r[4] > 0) return state.socks5State = r[4];
+        if (allowNeedMore && r[14] === 1) return state.needMore = true;
+        if (ssEnabled && chunk.length >= 34) {
+            try {
+                const decryptCtx = await createSsAeadCtx(chunk.subarray(0, 16));
+                const plain = await ssAeadDecryptFeed(decryptCtx, chunk.subarray(16));
+                const plainLen = plain.length;
+                if (plainLen > 0) {
+                    const addrType = plain[0];
+                    const addrLen = addrType === 3 ? (plainLen > 1 ? plain[1] : null) : addrType === 1 ? 4 : addrType === 4 ? 16 : -1;
+                    if (addrLen !== null && addrLen > 0) {
+                        const addrOffset = addrType === 3 ? 2 : 1;
+                        const dataOffset = addrOffset + addrLen + 2;
+                        if (plainLen >= dataOffset) {
+                            const portOffset = dataOffset - 2;
+                            const port = (plain[portOffset] << 8) | plain[portOffset + 1];
+                            parsedRequest = {addrType, addrBytes: plain.subarray(addrOffset, addrOffset + addrLen), dataOffset, port, isDns: port === 53};
+                            const encryptCtx = await createSsAeadCtx();
+                            isSs = true;
+                            payload = plain.subarray(dataOffset);
+                            state.ssInbound = decryptCtx;
+                            state.ssOutbound = encryptCtx;
+                            state.ssResponseSalt = encryptCtx.salt;
+                        }
+                    }
+                }
+            } catch {}
         }
-        return r[14] === 1 ? (state.needMore = true) : close();
+        if (!isSs) return close();
+    } else {
+        state.socks5State = 0;
+        parsedRequest = {addrType: r[5], port: r[6], dataOffset: r[7], isDns: r[8] === 1, addrBytes: chunk.subarray(r[9], r[9] + r[10]), isHttp: r[11] === 3};
+        payload = chunk.subarray(parsedRequest.dataOffset);
     }
-    state.needMore = false;
-    const parsedRequest = {addrType: r[5], port: r[6], dataOffset: r[7], isDns: r[8] === 1, addrBytes: chunk.subarray(r[9], r[9] + r[10]), isHttp: r[11] === 3};
-    const payload = chunk.subarray(parsedRequest.dataOffset);
     if (parsedRequest.isDns) {
         const dnsPack = await dohDnsHandler(payload);
-        if (dnsPack?.byteLength) writable.send(dnsPack);
+        if (dnsPack?.byteLength) {
+            if (isSs || state.ssOutbound) {
+                if (state.ssResponseSalt) {
+                    writable.send(state.ssResponseSalt);
+                    state.ssResponseSalt = null;
+                }
+                const encryptedDns = await ssAeadEncryptChunks(state.ssOutbound, dnsPack);
+                if (encryptedDns.byteLength) writable.send(encryptedDns);
+            } else {
+                writable.send(dnsPack);
+            }
+        }
         return close();
     } else {
         state.tcpSocket = await establishTcpConnection(parsedRequest, request);
         if (!state.tcpSocket) return close();
         const tcpWriter = state.tcpSocket.writable.getWriter();
         if (payload.byteLength) await tcpWriter.write(payload);
-        state.tcpWriter = (c) => tcpWriter.write(c);
-        if (state.tcpSocket.extra?.length) writable.send(state.tcpSocket.extra);
-        manualPipe(state.tcpSocket.readable, writable).finally(() => close());
+        if (isSs || state.ssOutbound) {
+            state.tcpWriter = async (c) => {
+                await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), async plain => {
+                    if (plain.byteLength) await tcpWriter.write(plain);
+                });
+            };
+            state.ssResponseSalt?.length && writable.send(state.ssResponseSalt);
+            state.ssResponseSalt = null;
+            (async () => {
+                let flushPromise = Promise.resolve();
+                state.tcpSocket.extra?.length && (flushPromise = flushPromise.then(async () => {
+                    const encryptedExtra = await ssAeadEncryptChunks(state.ssOutbound, state.tcpSocket.extra);
+                    encryptedExtra.byteLength && writable.send(encryptedExtra);
+                }));
+                try {
+                    await smartPipeCore(state.tcpSocket.readable, raw => {
+                        flushPromise = flushPromise.then(async () => {
+                            const encrypted = await ssAeadEncryptChunks(state.ssOutbound, raw);
+                            encrypted.byteLength && writable.send(encrypted);
+                        });
+                    });
+                } finally {await flushPromise}
+            })().finally(() => close());
+        } else {
+            state.tcpWriter = (c) => tcpWriter.write(c);
+            if (state.tcpSocket.extra?.length) writable.send(state.tcpSocket.extra);
+            smartPipeCore(state.tcpSocket.readable, raw => writable.send(raw)).finally(() => close());
+        }
     }
 };
 const handleWebSocketConn = async (webSocket, request) => {
     const protocolHeader = request.headers.get('sec-websocket-protocol');
     // @ts-ignore
     const earlyData = protocolHeader ? Uint8Array.fromBase64(protocolHeader, {alphabet: 'base64url'}) : null;
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null};
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null};
     const close = () => {state.tcpSocket?.close(), !earlyData && webSocket.close()};
     let processingChain = Promise.resolve();
     const process = async (chunk) => {
@@ -685,13 +903,12 @@ const handleWebSocketConn = async (webSocket, request) => {
 const grpcHeaders = {'Content-Type': 'application/grpc', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
 const xhttpHeaders = {'Content-Type': 'application/octet-stream', 'grpc-status': '0', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
 const handleGrpcPost = async (request, reader, buffer, used) => {
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null};
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null};
     return new Response(new ReadableStream({
         start(controller) {
             const writable = {
                 send: (chunk) => {
-                    const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-                    const len = data.byteLength;
+                    const len = chunk.byteLength;
                     let varintLen = 1;
                     for (let v = len >>> 7; v; v >>>= 7) varintLen++;
                     const totalPayloadLen = 1 + varintLen + len;
@@ -708,7 +925,7 @@ const handleGrpcPost = async (request, reader, buffer, used) => {
                         v >>>= 7;
                     }
                     grpcFrame[p++] = v;
-                    grpcFrame.set(data, p);
+                    grpcFrame.set(chunk, p);
                     controller.enqueue(grpcFrame);
                 }
             };
@@ -728,7 +945,7 @@ const handleGrpcPost = async (request, reader, buffer, used) => {
                             let p = grpcData[0] === 0x0A ? 1 : 0;
                             while (p && grpcData[p++] & 0x80) ;
                             const payload = p === 0 ? grpcData : grpcData.subarray(p);
-                            state.tcpWriter ? state.tcpWriter(payload) : await handleSession(payload, state, request, writable, close);
+                            state.tcpWriter ? await state.tcpWriter(payload) : await handleSession(payload, state, request, writable, close);
                         } else {break}
                     }
                     if (offset < bufLen) {
@@ -746,7 +963,7 @@ const handleGrpcPost = async (request, reader, buffer, used) => {
     }), {headers: grpcHeaders});
 };
 const handleXhttpPost = async (request, reader, xhttpBuffer, used) => {
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false};
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false, allowNeedMore: true, disableSsAead: true};
     return new Response(new ReadableStream({
         start(controller) {
             const writable = {send: (chunk) => controller.enqueue(chunk)};
@@ -755,7 +972,7 @@ const handleXhttpPost = async (request, reader, xhttpBuffer, used) => {
                 while (true) {
                     if (used > 0) {
                         const payload = new Uint8Array(xhttpBuffer, 0, used);
-                        state.tcpWriter ? state.tcpWriter(payload) : (state.needMore = false, await handleSession(payload, state, request, writable, close));
+                        state.tcpWriter ? await state.tcpWriter(payload) : (state.needMore = false, await handleSession(payload, state, request, writable, close));
                         if (!state.needMore) {
                             used = 0;
                             continue;
@@ -777,7 +994,7 @@ const getErrorResponse = async (status = 200) => {
 };
 const getSub = async (request, url, uuid) => {
     if (uuid && url.searchParams.get('uuid') !== uuid) return await getErrorResponse(404);
-    const UA = (request.headers.get('User-Agent') || '').toLowerCase();
+    const ua = (request.headers.get('User-Agent') || '').toLowerCase();
     const proxyPath = url.searchParams.get('path') || '';
     const host = url.hostname;
     const hasVL = url.searchParams.get('vl') === '1';
@@ -807,14 +1024,14 @@ const getSub = async (request, url, uuid) => {
     if (hasTR) addNodes(6);
     const finalLinks = parts.join("\n");
     const base64Links = btoa(unescape(encodeURIComponent(finalLinks)));
-    if (UA.includes(strList[18])) return new Response(base64Links, {headers: {'Content-Type': 'text/plain; charset=utf-8'}});
+    if (ua.includes(strList[18])) return new Response(base64Links, {headers: {'Content-Type': 'text/plain; charset=utf-8'}});
     if (url.searchParams.get('format') === 'raw') return new Response(finalLinks, {headers: {'Content-Type': 'text/plain; charset=utf-8'}});
-    const target = (url.searchParams.has(strList[5]) || UA.includes(strList[5]) || UA.includes(strList[15]) || UA.includes(strList[16])) ? strList[5]
-        : (url.searchParams.has(strList[11]) || url.searchParams.has(strList[6]) || UA.includes(strList[12]) || UA.includes(strList[6])) ? strList[6]
-            : (url.searchParams.has(strList[13]) || UA.includes(strList[13])) ? strList[7]
-                : (url.searchParams.has(strList[8]) || UA.includes(strList[14])) ? strList[8]
-                    : (url.searchParams.has(strList[9]) || UA.includes(strList[9])) ? strList[9]
-                        : (url.searchParams.has(strList[10]) || UA.includes(strList[10])) ? strList[10] : '';
+    const target = (url.searchParams.has(strList[5]) || ua.includes(strList[5]) || ua.includes(strList[15]) || ua.includes(strList[16])) ? strList[5]
+        : (url.searchParams.has(strList[11]) || url.searchParams.has(strList[6]) || ua.includes(strList[12]) || ua.includes(strList[6])) ? strList[6]
+            : (url.searchParams.has(strList[13]) || ua.includes(strList[13])) ? strList[7]
+                : (url.searchParams.has(strList[8]) || ua.includes(strList[14])) ? strList[8]
+                    : (url.searchParams.has(strList[9]) || ua.includes(strList[9])) ? strList[9]
+                        : (url.searchParams.has(strList[10]) || ua.includes(strList[10])) ? strList[10] : '';
     if (target) {
         const baseUrl = `${url.protocol}//${url.host}${url.pathname}?uuid=${globalThis.subUuid}&format=raw&path=${encPath}&vl=${hasVL ? 1 : 0}&tj=${hasTR ? 1 : 0}&ws=${hasWS ? 1 : 0}&xhttp=${hasXhttp ? 1 : 0}&grpc=${hasGRPC ? 1 : 0}`;
         const convertUrl = `${strList[0]}/sub?target=${target}&url=${encodeURIComponent(baseUrl)}&insert=false&config=${encodeURIComponent(strList[1])}&emoji=true&scv=true`;
@@ -864,13 +1081,13 @@ export default {
             return new Response(null, {status: 101, webSocket: clientSocket});
         }
         const url = new URL(request.url);
-        const {uuid, password, user, pass} = getEnv(env);
+        const {uuid, password, user, pass, sspass} = getEnv(env);
         if (url.pathname === '/sub') return await getSub(request, url, uuid);
         if (url.pathname === `/${uuid}` || url.pathname === `/${password}`) {
             if (!rawHtml) {
                 rawHtml = await decompressWasm(getPanelHtmlPtr, getPanelHtmlLen);
-                const map = {UUID: uuid, PASS: password, HTTPPASS: `${user}:${pass}`, IPLIST: JSON.stringify(ipListAll), ECHDNS: encodeURIComponent(sharedEchDns)};
-                rawHtml = rawHtml.replace(/{{(UUID|PASS|HTTPPASS|IPLIST|ECHDNS)}}/g, (_, k) => map[k]);
+                const map = {UUID: uuid, PASS: password, HTTPPASS: `${user}:${pass}`, SSPASS: sspass, IPLIST: JSON.stringify(ipListAll), ECHDNS: encodeURIComponent(sharedEchDns)};
+                rawHtml = rawHtml.replace(/{{(UUID|PASS|HTTPPASS|SSPASS|IPLIST|ECHDNS)}}/g, (_, k) => map[k]);
             }
             return new Response(rawHtml, {headers: {'Content-Type': 'text/html; charset=UTF-8'}});
         }

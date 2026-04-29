@@ -1,6 +1,6 @@
 name = "edcloudwasm"
 main = "_worker.js"  # 你的 JS 逻辑代码
-compatibility_date = "2026-04-20"
+compatibility_date = "2026-05-02"
 
 # pages中环境变量需要手动填写并重试部署才会生效，worker环境变量和路由自定义域名这些建议直接使用wrangler.toml文件来配置
 # --- worker环境变量配置 ---
@@ -9,6 +9,8 @@ compatibility_date = "2026-04-20"
 UUID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
 # Trojan 的密码
 PASSWORD = "666"
+# SS使用aes128gcm加密的密码
+SSPASS = "666"
 # S5和HTTP 入站验证用户名 
 S5HTTPUSER = "admin"
 # S5和HTTP入站验证密码

@@ -334,26 +334,36 @@ unsafe fn find_value_end(data: *const u8, mut i: usize, end: usize, stop_eq: boo
     i
 }
 
-/// 查找下一个 URL 参数起始位置（'?' / '&' 之后）
+/// 查找下一个可能的 URL 参数 key 起点。
 #[inline(always)]
-unsafe fn find_next_param_start(data: *const u8, mut i: usize, end: usize) -> Option<usize> {
+unsafe fn find_next_key_start(data: *const u8, mut i: usize, end: usize) -> Option<usize> {
     use core::arch::wasm32::{i8x16_eq, u8x16_bitmask, u8x16_splat, v128, v128_load, v128_or};
+    let g = u8x16_splat(b'g');
+    let s = u8x16_splat(b's');
+    let h = u8x16_splat(b'h');
+    let n = u8x16_splat(b'n');
+    let t = u8x16_splat(b't');
+    let ip = u8x16_splat(b'i');
+    let p = u8x16_splat(b'p');
     let qm = u8x16_splat(b'?');
     let amp = u8x16_splat(b'&');
     while i + 16 <= end {
         let vv = v128_load(data.add(i) as *const v128);
-        let mask = u8x16_bitmask(v128_or(i8x16_eq(vv, qm), i8x16_eq(vv, amp))) as u32;
+        let m0 = v128_or(i8x16_eq(vv, g), i8x16_eq(vv, s));
+        let m1 = v128_or(i8x16_eq(vv, h), i8x16_eq(vv, n));
+        let m2 = v128_or(i8x16_eq(vv, t), i8x16_eq(vv, ip));
+        let m3 = v128_or(i8x16_eq(vv, p), i8x16_eq(vv, qm));
+        let mask = u8x16_bitmask(v128_or(v128_or(m0, m1), v128_or(v128_or(m2, m3), i8x16_eq(vv, amp)))) as u32;
         if mask != 0 {
-            return Some(i + mask.trailing_zeros() as usize + 1);
+            return Some(i + mask.trailing_zeros() as usize);
         }
         i += 16;
     }
     while i < end {
-        let b = *data.add(i);
-        if b == b'?' || b == b'&' {
-            return Some(i + 1);
+        match *data.add(i) {
+            b'g' | b's' | b'h' | b'n' | b't' | b'i' | b'p' | b'?' | b'&' => return Some(i),
+            _ => i += 1,
         }
-        i += 1;
     }
     None
 }
@@ -1061,7 +1071,7 @@ pub unsafe extern "C" fn parseUrlWasm(url_len: i32) {
             }
         }
         if !matched {
-            if let Some(next_i) = find_next_param_start(data_ptr, i, len) {
+            if let Some(next_i) = find_next_key_start(data_ptr, i + 1, len) {
                 i = next_i;
             } else {
                 break;

@@ -735,76 +735,65 @@ const establishTcpConnection = async (parsedRequest, request) => {
     }
     return null;
 };
-const chunkIdxLookup = new Uint8Array(60);
-for (let i = 0; i < 60; i++) {
-    let len = i << 9;
-    if (len < 1536) {
-        chunkIdxLookup[i] = 0;
-    } else if (len < 2048) {
-        chunkIdxLookup[i] = 1;
-    } else if (len < 2560) {
-        chunkIdxLookup[i] = 2;
-    } else if (len < 3072) {
-        chunkIdxLookup[i] = 3;
-    } else if (len < 3584) {
-        chunkIdxLookup[i] = 4;
-    } else if (len < 4096) {
-        chunkIdxLookup[i] = 5;
-    } else if (len < 5120) {
-        chunkIdxLookup[i] = 6;
-    } else if (len < 6144) {
-        chunkIdxLookup[i] = 7;
-    } else if (len < 7168) {
-        chunkIdxLookup[i] = 8;
-    } else if (len < 8192) {
-        chunkIdxLookup[i] = 9;
-    } else if (len < 12288) {
-        chunkIdxLookup[i] = 10;
-    } else if (len < 20480) {
-        chunkIdxLookup[i] = 11;
-    } else {
-        chunkIdxLookup[i] = 12;
-    }
-}
+const chunkIdxLookup = new Uint8Array([
+    0, 0, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 10, 10,
+    10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12
+]);
 const lowerBounds = new Uint16Array([1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 12288, 20480, 28672]);
 const smartPipeCore = async (readable, onFlush, close) => {
     const safeBufferSize = bufferSize - maxChunkLen;
-    let buffer = new Uint8Array(bufferSize), chunkBuf = new ArrayBuffer(maxChunkLen);
-    let offset = 0, totalBytes = 0, time = 2, timerId = null, resume = null;
+    let buffer = new ArrayBuffer(bufferSize), spareBuffer = new ArrayBuffer(maxChunkLen);
+    let offset = 0, totalBytes = 0, time = 2, timerId = null, resume = null, isReading = false, needsFlush = false, protectFlush = false;
     let globalCount = new Float64Array(14), globalBytes = new Float64Array(14);
     let statCount = 0, totalCount = 0, totalGlobalBytes = 0;
     const flushBuffer = () => {
-        offset > 0 && (onFlush(buffer.slice(0, offset)), offset = 0);
-        timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
+        if (isReading) return needsFlush = true;
+        offset > 0 && (offset > safeBufferSize ? (onFlush(new Uint8Array(buffer, 0, offset)), buffer = new ArrayBuffer(bufferSize)) : onFlush(new Uint8Array(buffer.slice(0, offset))), offset = 0);
+        needsFlush = false, protectFlush = false, timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
     const reader = readable.getReader({mode: 'byob'});
     try {
         while (true) {
-            const {done, value} = await reader.read(new Uint8Array(chunkBuf));
+            const useSpare = offset > 0 && protectFlush;
+            let readBuffer = buffer, readOffset = offset;
+            isReading = offset > 0;
+            useSpare && (readBuffer = spareBuffer, readOffset = 0, isReading = false);
+            const {done, value} = await reader.read(new Uint8Array(readBuffer, readOffset, maxChunkLen));
+            isReading = false;
+            useSpare ? (new Uint8Array(buffer).set(value, offset), spareBuffer = value.buffer) : (buffer = value.buffer);
             if (done) break;
-            chunkBuf = value.buffer;
             const chunkLen = value.byteLength;
-            if (!chunkLen) continue;
-            const idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
-            globalCount[idx]++, globalBytes[idx] += chunkLen;
-            statCount++, totalCount++, totalGlobalBytes += chunkLen;
-            if (statCount > 1000000) {
-                statCount = 0, totalCount *= 0.5, totalGlobalBytes *= 0.5;
-                for (let i = 0; i < 14; i++) globalCount[i] *= 0.5, globalBytes[i] *= 0.5;
+            if (!chunkLen) {
+                needsFlush && flushBuffer();
+                continue;
             }
-            let maxScore = -1, maxIdx = 0;
-            const cFactor = 0.8 / totalCount, bFactor = 0.2 / totalGlobalBytes;
-            for (let i = 0; i < 14; i++) {
-                const score = globalCount[i] * cFactor + globalBytes[i] * bFactor;
-                score > maxScore && (maxScore = score, maxIdx = i);
+            offset += chunkLen;
+            if (needsFlush) {
+                flushBuffer();
+            } else {
+                const idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
+                globalCount[idx]++, globalBytes[idx] += chunkLen, statCount++, totalCount++, totalGlobalBytes += chunkLen, protectFlush = chunkLen < maxChunkLen;
+                if (statCount > 16384) {
+                    statCount = 0, totalCount *= 0.5, totalGlobalBytes *= 0.5;
+                    for (let i = 0; i < 14; i++) globalCount[i] *= 0.5, globalBytes[i] *= 0.5;
+                }
+                let maxScore = -1, maxIdx = 0;
+                const byteFactor = 0.25 * totalCount / totalGlobalBytes;
+                for (let i = 0; i < 14; i++) {
+                    const score = globalCount[i] + globalBytes[i] * byteFactor;
+                    score > maxScore && (maxScore = score, maxIdx = i);
+                }
+                if (chunkLen < lowerBounds[maxIdx]) {
+                    totalBytes = 0, time = 2;
+                } else if ((totalBytes += chunkLen) > startThreshold) {
+                    time = flushTime;
+                }
+                timerId ||= setTimeout(flushBuffer, time);
+                offset > safeBufferSize && (time === flushTime ? await new Promise(r => resume = r) : flushBuffer());
             }
-            chunkLen < lowerBounds[maxIdx] && (totalBytes = 0, time = 2);
-            buffer.set(value, offset), offset += chunkLen, totalBytes += chunkLen;
-            totalBytes > startThreshold && (time = flushTime);
-            timerId ||= setTimeout(flushBuffer, time);
-            offset > safeBufferSize && (time === flushTime ? await new Promise(r => resume = r) : flushBuffer());
         }
-    } catch {close?.()} finally {flushBuffer()}
+    } catch {close?.()} finally {isReading = false, flushBuffer()}
 };
 const handleSession = async (chunk, state, request, writable, close) => {
     const allowNeedMore = state.allowNeedMore === true;

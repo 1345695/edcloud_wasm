@@ -741,15 +741,24 @@ const chunkIdxLookup = new Uint8Array([
     12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12
 ]);
 const lowerBounds = new Uint16Array([1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 12288, 20480, 28672]);
-const smartPipeCore = async (readable, onFlush, close) => {
+const manualPipe = async (readable, writable, close) => {
     const safeBufferSize = bufferSize - maxChunkLen;
-    let buffer = new ArrayBuffer(bufferSize), spareBuffer = new ArrayBuffer(maxChunkLen);
+    let buffer = new ArrayBuffer(bufferSize), spareBuffer = new ArrayBuffer(maxChunkLen), bufferView = new Uint8Array(buffer);
     let offset = 0, totalBytes = 0, time = 2, timerId = null, resume = null, isReading = false, needsFlush = false, protectFlush = false;
-    let globalCount = new Float64Array(14), globalBytes = new Float64Array(14);
-    let statCount = 0, totalCount = 0, totalGlobalBytes = 0;
+    let globalCount = new Uint32Array(14), globalBytes = new Uint32Array(14);
+    let statCount = 0, totalCount = 0, totalGlobalBytes = 0, isClose = false;
     const flushBuffer = () => {
         if (isReading) return needsFlush = true;
-        offset > 0 && (offset > safeBufferSize ? (onFlush(new Uint8Array(buffer, 0, offset)), buffer = new ArrayBuffer(bufferSize)) : onFlush(new Uint8Array(buffer.slice(0, offset))), offset = 0);
+        if (offset > 0 && !isClose) {
+            if (offset > safeBufferSize) {
+                writable.send(bufferView.subarray(0, offset));
+                buffer = new ArrayBuffer(bufferSize);
+                bufferView = new Uint8Array(buffer);
+            } else {
+                writable.send(bufferView.slice(0, offset));
+            }
+            offset = 0;
+        }
         needsFlush = false, protectFlush = false, timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
     const reader = readable.getReader({mode: 'byob'});
@@ -761,7 +770,13 @@ const smartPipeCore = async (readable, onFlush, close) => {
             useSpare && (readBuffer = spareBuffer, readOffset = 0, isReading = false);
             const {done, value} = await reader.read(new Uint8Array(readBuffer, readOffset, maxChunkLen));
             isReading = false;
-            useSpare ? (new Uint8Array(buffer).set(value, offset), spareBuffer = value.buffer) : (buffer = value.buffer);
+            if (useSpare) {
+                bufferView.set(value, offset);
+                spareBuffer = value.buffer;
+            } else {
+                buffer = value.buffer;
+                bufferView = new Uint8Array(buffer);
+            }
             if (done) break;
             const chunkLen = value.byteLength;
             if (!chunkLen) {
@@ -775,8 +790,8 @@ const smartPipeCore = async (readable, onFlush, close) => {
                 const idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
                 globalCount[idx]++, globalBytes[idx] += chunkLen, statCount++, totalCount++, totalGlobalBytes += chunkLen, protectFlush = chunkLen < maxChunkLen;
                 if (statCount > 16384) {
-                    statCount = 0, totalCount *= 0.5, totalGlobalBytes *= 0.5;
-                    for (let i = 0; i < 14; i++) globalCount[i] *= 0.5, globalBytes[i] *= 0.5;
+                    statCount = 0, totalCount >>>= 1, totalGlobalBytes >>>= 1;
+                    for (let i = 0; i < 14; i++) globalCount[i] >>>= 1, globalBytes[i] >>>= 1;
                 }
                 let maxScore = -1, maxIdx = 0;
                 const byteFactor = 0.25 * totalCount / totalGlobalBytes;
@@ -793,7 +808,7 @@ const smartPipeCore = async (readable, onFlush, close) => {
                 offset > safeBufferSize && (time === flushTime ? await new Promise(r => resume = r) : flushBuffer());
             }
         }
-    } catch {close?.()} finally {isReading = false, flushBuffer()}
+    } catch {close?.(), isClose = true} finally {isReading = false, flushBuffer()}
 };
 const handleSession = async (chunk, state, request, writable, close) => {
     const allowNeedMore = state.allowNeedMore === true;
@@ -876,18 +891,20 @@ const handleSession = async (chunk, state, request, writable, close) => {
                     encryptedExtra.byteLength && writable.send(encryptedExtra);
                 }));
                 try {
-                    await smartPipeCore(state.tcpSocket.readable, raw => {
-                        flushPromise = flushPromise.then(async () => {
-                            const encrypted = await ssAeadEncryptChunks(state.ssOutbound, raw);
-                            encrypted.byteLength && writable.send(encrypted);
-                        });
+                    await manualPipe(state.tcpSocket.readable, {
+                        send: (chunk) => {
+                            flushPromise = flushPromise.then(async () => {
+                                const encrypted = await ssAeadEncryptChunks(state.ssOutbound, chunk);
+                                encrypted.byteLength && writable.send(encrypted);
+                            });
+                        }
                     }, close);
                 } finally {await flushPromise}
             })();
         } else {
             state.tcpWriter = (c) => tcpWriter.write(c);
             if (state.tcpSocket.extra?.length) writable.send(state.tcpSocket.extra);
-            smartPipeCore(state.tcpSocket.readable, raw => writable.send(raw), close);
+            manualPipe(state.tcpSocket.readable, writable, close);
         }
     }
 };
